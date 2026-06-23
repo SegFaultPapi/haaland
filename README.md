@@ -1,53 +1,66 @@
-# Haaland — Sports Trading Agent for Polymarket
+# Haaland
 
-A semi-autonomous trading agent for soccer markets on Polymarket. Detects real edge by combining news, live market data, and LLM analysis — then executes or proposes trades via Telegram.
+> A semi-autonomous trading agent for soccer prediction markets on Polymarket.
 
-## The Problem
+Haaland monitors active soccer markets, reads the latest team news, analyzes price momentum and order flow, and uses Claude to determine whether the market is mispriced. When it finds real edge, it either executes a trade automatically or asks you for confirmation via Telegram.
 
-Polymarket traders in soccer markets operate blind: there's no fast way to detect edge using real context (news, injuries, lineups, price momentum, smart money). There's also no tool to analyze parlays with an honest probability breakdown per leg.
+---
 
-## How It Works (5 steps)
+## Why this exists
 
-1. Scans active soccer markets on Polymarket via **Gamma API**
-2. Fetches news from the last 48h for both teams via **GNews**
-3. Pulls live market data: price, volume, spread, and large orders via **CLOB API**
-4. **Claude Haiku** analyzes all context and computes a **composite score (0–100)** → `{signal, confidence, edge, score, reasoning}`
-5. If score ≥ 75 → auto-executes. If 50–74 → asks user via Telegram. If < 50 → SKIP
+Polymarket soccer markets move fast and are hard to track manually. By the time you read about an injury or a lineup change, the price has already moved. Haaland closes that gap by running continuously, processing news and market data together, and surfacing only the opportunities where the numbers actually make sense.
 
-## MVP Features
+---
 
-### Core engine
-- Active soccer markets from Polymarket Gamma API
-- Team news via GNews (free, 100 req/day)
-- Claude Haiku analysis → structured JSON signal: `BUY YES / BUY NO / SKIP`
-- Configurable mode: **semi-auto** (you approve) or **auto** (executes if score ≥ 75)
-- Trade execution via `py-clob-client`
-- Trade history in SQLite
+## How it works
 
-### Market analytics (no extra APIs needed)
-- Live price, 1h/24h change, and momentum from CLOB API
-- Volume, liquidity, and bid/ask spread — auto-SKIP if spread > 10%
-- Price snapshots every 30min in SQLite → detects sustained trends
-- Smart money detection: flags single orders > $500 in the order book
+```mermaid
+flowchart TD
+    A[Gamma API\nActive soccer markets] --> D
+    B[GNews\nTeam news last 48h] --> D
+    C[CLOB API\nPrice · Volume · Order book] --> D
 
-### Composite score (0–100)
+    D[Claude Haiku\nAnalyze context] --> E[Composite Score\n0 – 100]
 
-| Signal | Max points |
+    E -->|Score ≥ 75| F[Auto-execute trade]
+    E -->|Score 50–74| G[Ask user via Telegram]
+    E -->|Score < 50| H[Skip]
+```
+
+The composite score combines four signals:
+
+| Signal | Weight |
 |---|---|
-| LLM edge (prob vs market price) | 40 pts |
-| Price momentum (confirms or contradicts signal) | 20 pts |
-| Liquidity (tight spread = trustworthy price) | 20 pts |
-| Smart money (whale buying = confirmation) | 20 pts |
+| LLM edge — estimated probability vs market price | 40 pts |
+| Price momentum — 1h / 24h trend confirms the signal | 20 pts |
+| Liquidity — tight spread means the price is trustworthy | 20 pts |
+| Smart money — whale orders (> $500) in the order book | 20 pts |
 
-### Parlay & free-query analysis
+Markets with a bid/ask spread above 10% are automatically skipped regardless of score.
 
-User writes natural language in Telegram (private or group chat):
+---
+
+## Telegram interface
+
+The bot works in both private chats and group chats. Anyone in a group can ask for signals and analysis. Trade execution is restricted to your private `chat_id`.
+
+| Command | What it does |
+|---|---|
+| `/start` | Status and introduction |
+| `/markets` | Lists active soccer markets right now |
+| `/signal [team]` | Full analysis and BUY / SELL / SKIP signal for a match |
+| `/score [team]` | Composite score 0–100 with a breakdown of each signal |
+| `/whales` | Large orders detected in the last 24h |
+| `/summary` | Daily P&L and executed trades |
+| `/analyze [query]` | Natural language parlay or single-event analysis |
+
+### Parlay analysis
+
+`/analyze` understands free-text queries and handles multi-leg parlays:
 
 ```
 /analyze Will Spain win the World Cup AND Mbappé scores in the final?
 ```
-
-Bot response:
 
 ```
 Parlay Analysis
@@ -64,51 +77,80 @@ Parlay Analysis
 
 ─────────────────────
  Combined probability
-   Market implied:   42% × 38% = 15.9%
-   Agent estimate:   51% × 29% = 14.8%
+   Market implied:   15.9%
+   Agent estimate:   14.8%
 
  Final verdict: SKIP
-   Parlay is roughly fairly priced.
-   Leg 2 is slightly overpriced by the market.
-   Better to play Leg 1 alone if anything.
+   Leg 2 is slightly overpriced. Better to play Leg 1 alone.
 ```
 
-Claude parses the free-text query → extracts teams/players/events → searches each leg in Gamma API → runs the same `analyst.py` per leg → multiplies estimated probabilities → compares against the combined market price.
+Each leg is analyzed independently using the same engine, then combined into a final verdict.
 
-### Telegram bot commands
+---
 
-Works in private chat **and** group chats:
+## Architecture
 
-| Command | Description |
+```mermaid
+flowchart LR
+    subgraph Data
+        A[markets.py\nGamma API]
+        B[news.py\nGNews]
+        C[market_data.py\nCLOB API]
+    end
+
+    subgraph Analysis
+        D[analyst.py\nClaude Haiku]
+        E[scorer.py\nComposite score]
+        F[parlay.py\nMulti-leg parser]
+    end
+
+    subgraph Output
+        G[executor.py\nTrade execution]
+        H[alerts.py\nTelegram bot]
+        I[db.py\nSQLite]
+    end
+
+    A --> D
+    B --> D
+    C --> D
+    D --> E
+    E --> G
+    E --> H
+    F --> D
+    H --> F
+    G --> I
+    C --> I
+```
+
+### Module breakdown
+
+| File | Responsibility |
 |---|---|
-| `/start` | Bot introduction and current status |
-| `/markets` | Lists active soccer markets right now |
-| `/signal [team]` | Full analysis + BUY/SELL/SKIP signal for that match |
-| `/score [team]` | Composite score 0–100 with breakdown |
-| `/whales` | Large orders detected in the last 24h |
-| `/summary` | Daily P&L and executed trades |
-| `/analyze [query]` | Free-text parlay or single event analysis |
+| `main.py` | Main loop — runs the full pipeline every X minutes |
+| `markets.py` | Fetches active soccer markets from Gamma API |
+| `news.py` | Pulls last 48h of team news from GNews |
+| `market_data.py` | Gets price, volume, spread, and order book from CLOB API |
+| `analyst.py` | Sends context to Claude Haiku, returns structured signal |
+| `scorer.py` | Combines LLM edge, momentum, liquidity, and smart money into 0–100 |
+| `parlay.py` | Parses free-text queries, runs analyst per leg, combines probabilities |
+| `executor.py` | Executes trades via `py-clob-client` |
+| `alerts.py` | Telegram bot and all command handlers |
+| `db.py` | Persists trade history and price snapshots in SQLite |
 
-> Trade execution is restricted to your private `chat_id`. Insights, signals, and `/analyze` are public in groups.
+---
 
-## Project Structure
+## Setup
 
-```
-haaland/
-├── main.py          ← main loop (runs every X minutes)
-├── markets.py       ← Gamma API → active soccer markets + free-text search
-├── news.py          ← GNews → team news (last 48h)
-├── market_data.py   ← CLOB API → price, volume, spread, smart money
-├── analyst.py       ← Claude Haiku prompt → BUY/SELL/SKIP + reasoning
-├── scorer.py        ← composite score 0–100
-├── parlay.py        ← parlay parser + multi-leg analyzer (reuses analyst.py)
-├── executor.py      ← py-clob-client
-├── alerts.py        ← Telegram bot + all command handlers incl. /analyze
-├── db.py            ← SQLite: trades + price snapshots
-└── .env             ← POLYMARKET_KEY, CLAUDE_KEY, TELEGRAM_TOKEN, GNEWS_KEY
+**Requirements:** Python 3.11+, a Polymarket wallet, a Telegram bot token, and a Claude API key.
+
+```bash
+git clone https://github.com/youruser/haaland
+cd haaland
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## Environment Variables
+Fill in `.env`:
 
 ```env
 POLYMARKET_KEY=
@@ -117,43 +159,27 @@ TELEGRAM_TOKEN=
 GNEWS_KEY=
 ```
 
-## Estimated Monthly Cost
+Run:
 
-| Component | Cost |
-|---|---|
-| Gamma API (Polymarket markets) | Free |
-| CLOB API (price, volume, orders) | Free |
-| GNews API (news) | Free |
-| Telegram bot | Free |
-| Claude Haiku (~600 analyses/month incl. `/analyze`) | ~$4–6 |
-| Server (Railway free tier or local) | ~$0–5 |
-| **Total** | **$4–11/month** |
-
-## 3-Week Build Plan
-
-| Week | Deliverable |
-|---|---|
-| 1 | Gamma API + GNews + CLOB market data running, output visible in console |
-| 2 | Claude Haiku analysis, composite score, Telegram commands `/signal` `/score` `/whales` |
-| 3 | `/analyze` parlay command, trade execution, SQLite history, 1-week paper trading |
-
-## Not in MVP
-
-- Web dashboard
-- Monte Carlo / GBM (v2)
-- Live in-match trading (high frequency)
-- Full Smart Score system (Hashdive-style, requires blockchain indexer)
-- Advanced stats (API-Football, xG, ELO)
-- Multi-sport (NBA, UFC, etc.)
-- Formal backtesting
-- Full Kelly Criterion
-- LLM + quant engine fusion
-- Parlay history (v1.1)
-
-## Success Criteria
-
-The MVP works if: the agent generates at least 1 signal with real edge per match day, any user can write `/analyze` in a Telegram group and get an honest probability breakdown per leg, and trade execution on Polymarket works without manual intervention.
+```bash
+python main.py
+```
 
 ---
 
-*Haaland — Sports Trading Agent for Polymarket · June 2026*
+## Cost
+
+Everything except Claude runs on free tiers. At roughly 600 analyses per month (automated scans + `/analyze` queries), the total cost is **$4–11/month**.
+
+| Component | Cost |
+|---|---|
+| Gamma API | Free |
+| CLOB API | Free |
+| GNews | Free |
+| Telegram | Free |
+| Claude Haiku | ~$4–6/month |
+| Server (Railway or local) | $0–5/month |
+
+---
+
+*June 2026*
